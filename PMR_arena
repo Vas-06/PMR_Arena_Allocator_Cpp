@@ -1,0 +1,134 @@
+#include <alloca.h>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <functional>
+#include <iostream>
+#include <iterator>
+#include <memory>
+#include <memory_resource>
+#include <new>
+#include <optional>
+#include <type_traits>
+#include <utility>
+#include <vector>
+#include <cassert>
+
+struct destructors {
+  std::function<void(void *)> instructions;
+  void *obj;
+};
+
+template <typename T> class memory : public std::pmr::memory_resource {
+
+private:
+  std::byte *start = nullptr;
+  std::byte *current = start;
+  std::byte *end = start;
+  std::vector<destructors> trigger;
+  size_t capacity = 0;
+
+public:
+  memory(size_t size) {
+    capacity = size;
+    block();
+  }
+  void *block() {
+    void *block = ::operator new(capacity);
+    start = static_cast<std::byte *>(block);
+    current = start;
+    end = start;
+    return current;
+  }
+  void *do_allocate(size_t bytes, size_t align) override {
+    uintptr_t address = reinterpret_cast<uintptr_t>(current);
+
+    uintptr_t aligned = (address + align - 1) & ~(uintptr_t)(align - 1);
+    size_t used = aligned - reinterpret_cast<uintptr_t>(start);
+    if (used > capacity || bytes > capacity - used)
+      throw std::bad_alloc();
+    current = start + used + bytes;
+    return start + used;
+    
+  }
+  template <typename U> std::function<void(void *)> makedestruct() {
+    return [](void *ptr) {
+      if (ptr) {
+        // std::cout << "DESTRUCTION\n";
+        std::destroy_at(static_cast<U *>(ptr));
+      }
+    };
+  }
+
+  void do_deallocate(void *, size_t, size_t) override {
+    //
+  }
+
+  void reset() {
+    destruct();
+    trigger.clear();
+    current = start;
+  }
+
+  void destruct() {
+    for (auto& i : trigger) {
+      i.instructions(i.obj);
+    }
+  }
+
+  bool
+  do_is_equal(const std::pmr::memory_resource &other) const noexcept override {
+    return this == &other;
+  }
+
+  template <typename C, typename... Args> C *create(Args &&...args) {
+    auto memory = do_allocate(sizeof(C), alignof(C));
+    auto construction = std::construct_at(reinterpret_cast<C *>(memory),
+                                          std::forward<Args>(args)...);
+    if constexpr (!std::is_trivially_destructible_v<C>) {
+      destructors de;
+      de.instructions = makedestruct<C>();
+      // std::cout << "destructor saved \n";
+      de.obj = construction;
+      trigger.push_back(de);
+    }
+
+    return reinterpret_cast<C *>(construction);
+  }
+  bool owns(const void *p) const { auto b = (const std::byte*)p; return b >= start && b < start + capacity; }
+
+  ~memory() { reset();
+    ::operator delete(start); }
+};
+
+
+struct Counter { static inline int n = 0; ~Counter() { ++n; } };
+
+int main() {
+  { // alignment
+    memory<int> m(64);
+    m.do_allocate(1, 1);
+    void *p = m.allocate(8, 8);
+    assert(reinterpret_cast<uintptr_t>(p) % 8 == 0);
+  }
+  { // padding counted in the bounds check
+    memory<int> m(16);
+    m.do_allocate(9, 1);
+    bool threw = false;
+    try { m.do_allocate(7, 8); } catch (const std::bad_alloc &) { threw = true; }
+    assert(threw);
+  }
+  { // each destructor runs exactly once
+    memory<int> m(256);
+    m.create<Counter>(); m.create<Counter>();
+    m.reset(); m.reset();
+    assert(Counter::n == 2);
+  }
+  { // PMR wiring: element buffer lives in the arena
+    memory<int> m(1024);
+    auto *v = m.create<std::pmr::vector<std::pmr::string>>(&m);
+    v->push_back(std::pmr::string(100, 'x'));
+    assert(m.owns(v->data()));
+    assert(m.owns((*v)[0].data()));
+  }
+}
